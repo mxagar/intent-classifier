@@ -1595,4 +1595,37 @@ Engineering:
   uv
   modular production/training boundary
 ```
- 
+
+## 30. Post-Implementation Review Actions
+
+- Removed `from __future__ import annotations` from all project modules.
+- Added `text_hash()` for privacy-preserving prediction logs: it lets production logs correlate repeated messages without storing raw text.
+- Added `compute_pos_weights()` to compensate for sparse multi-label targets during BCE training.
+- Expanded Optuna HPO to tune dropout, max sequence length, batch size, learning rates, weight decay, max positive-label weight, and per-head hidden sizes.
+- Moved trial-specific `TrainConfig` and `ModelConfig` creation into the HPO objective flow.
+- Added `save_study()` and `load_study()` for JSON-based Optuna study persistence.
+- Added `train_study()` to train a final model from the best parameters in a saved study JSON.
+- Removed the separate calibration split; validation data is used for calibration and threshold tuning.
+- Replaced dataclass-based config validation with Pydantic models.
+- Added `--hpo` to the training CLI.
+- Changed the default hidden-layer activation to `relu`.
+- Replaced `Literal` config values with `Enum` types.
+- Updated `TextClassifier.forward()` to return PyTorch feature vectors under the `features` key.
+- Kept ONNX export logits-only by using an export wrapper that filters out `features`.
+- Added usage examples to modules with CLI `main()` functions.
+- Implemented artifact layout helpers for versioned model releases and HPO runs:
+
+```text
+intent_classifier/artifacts/
+  hpo/
+    <date-time>/
+      study.json
+      artifacts/
+        trial_0000/
+        trial_0001/
+  v1/
+    model artifacts
+  v2/
+    model artifacts
+  changelog.yaml
+```

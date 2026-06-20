@@ -127,4 +127,3 @@ does not depend on Hugging Face connectivity at runtime.
 
 Mikel Sagardia, 2026.  
 No guarantees.
-
