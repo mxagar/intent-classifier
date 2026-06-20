@@ -42,6 +42,37 @@ The default model config is:
 intent_classifier/config/model_config.yaml
 ```
 
+Example head definitions (extended in `model_config.yaml`):
+
+```yaml
+heads:
+  - name: business
+    mode: multi_label
+    labels:
+      - create_budget
+      - create_invoice
+      - schedule_visit
+      - cancel_visit
+      - modify_visit
+      - send_document
+      - add_customer
+      - update_customer
+      - ask_price
+      - ask_status
+
+  - name: undesired
+    mode: multi_label
+    labels:
+      - prompt_injection
+      - abuse
+      - spam
+      - fraud_attempt
+      - unsafe_data_request
+      - unsupported_request
+      - irrelevant_request
+      - ambiguous_request
+```
+
 ## Training
 
 Run the default training command:
@@ -118,6 +149,44 @@ for head_name, head_prediction in prediction.items():
     print(head_name)
     print("probabilities:", head_prediction.probabilities)
     print("active labels:", head_prediction.active_labels)
+```
+
+`estimator.predict(...)` returns a dictionary keyed by head name. The values are
+`HeadPrediction` objects:
+
+```python
+{
+    "business": HeadPrediction(
+        mode="multi_label",
+        probabilities={
+            "create_budget": 0.91,
+            "create_invoice": 0.04,
+            "schedule_visit": 0.86,
+            "cancel_visit": 0.01,
+            "modify_visit": 0.03,
+            "send_document": 0.02,
+            "add_customer": 0.01,
+            "update_customer": 0.01,
+            "ask_price": 0.12,
+            "ask_status": 0.05,
+        },
+        active_labels=["create_budget", "schedule_visit"],
+    ),
+    "undesired": HeadPrediction(
+        mode="multi_label",
+        probabilities={
+            "prompt_injection": 0.01,
+            "abuse": 0.01,
+            "spam": 0.02,
+            "fraud_attempt": 0.01,
+            "unsafe_data_request": 0.01,
+            "unsupported_request": 0.04,
+            "irrelevant_request": 0.02,
+            "ambiguous_request": 0.08,
+        },
+        active_labels=[],
+    ),
+}
 ```
 
 Production inference loads the tokenizer from the artifact directory with local files only, so it
