@@ -1,0 +1,46 @@
+backbone:
+  name: microsoft/Multilingual-MiniLM-L12-H384
+  revision: main
+  local_tokenizer_path: intent_classifier/artifacts/tokenizer
+
+text:
+  max_length: 128
+  truncation: true
+  padding: max_length
+
+classifier:
+  dropout: 0.2
+
+heads:
+  - name: business
+    mode: multi_label
+    hidden_layer:
+      size: 256
+      activation: gelu
+    labels:
+      - create_budget
+      - create_invoice
+      - schedule_visit
+      - cancel_visit
+      - modify_visit
+      - send_document
+      - add_customer
+      - update_customer
+      - ask_price
+      - ask_status
+
+  - name: undesired
+    mode: multi_label
+    hidden_layer:
+      size: 128
+      activation: gelu
+    labels:
+      - prompt_injection
+      - abuse
+      - spam
+      - fraud_attempt
+      - unsafe_data_request
+      - unsupported_request
+      - irrelevant_request
+      - ambiguous_request
+

@@ -1,0 +1,38 @@
+seed: 42
+dataset_csv: dataset/train.csv
+model_config: intent_classifier/config/model_config.yaml
+artifact_dir: intent_classifier/artifacts/v1
+
+splits:
+  train: 0.7
+  validation: 0.1
+  calibration: 0.1
+  test: 0.1
+  group_column: null
+
+training:
+  phase_1:
+    freeze_backbone: true
+    epochs: 3
+    learning_rate_classifier: 0.0005
+    batch_size: 16
+  phase_2:
+    freeze_backbone: false
+    epochs: 3
+    learning_rate_backbone: 0.00002
+    learning_rate_classifier: 0.0002
+    batch_size: 16
+  weight_decay: 0.01
+  gradient_clipping: 1.0
+  early_stopping_patience: 3
+
+loss:
+  head_weights:
+    business: 1.0
+    undesired: 1.5
+  max_pos_weight: 10.0
+
+optuna:
+  enabled: false
+  n_trials: 30
+
