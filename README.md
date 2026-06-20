@@ -123,3 +123,8 @@ for head_name, head_prediction in prediction.items():
 Production inference loads the tokenizer from the artifact directory with local files only, so it
 does not depend on Hugging Face connectivity at runtime.
 
+## Authorship
+
+Mikel Sagardia, 2026.  
+No guarantees.
+
