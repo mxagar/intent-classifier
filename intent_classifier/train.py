@@ -1,9 +1,8 @@
-"""Training, metrics, calibration, thresholds, and export utilities."""
-
-from __future__ import annotations
+"""Training, HPO, metrics, calibration, thresholds, and export utilities."""
 
 import argparse
 import logging
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -11,17 +10,24 @@ import numpy as np
 import optuna
 import torch
 import torch.nn.functional as F
+import yaml
 from onnxruntime.quantization import QuantType, quantize_dynamic
+from optuna.distributions import distribution_to_json, json_to_distribution
 from sklearn.metrics import f1_score, precision_recall_fscore_support
 from torch.optim import AdamW, Optimizer
 from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader
 
-from intent_classifier.dataset import RequestDataset, create_data_loaders, split_ids
+from intent_classifier.dataset import (
+    RequestDataset,
+    compute_label_distributions,
+    create_data_loaders,
+    split_ids,
+)
 from intent_classifier.model import TextClassifier, create_model, export_onnx
 from intent_classifier.preprocessing import export_tokenizer, load_tokenizer
 from intent_classifier.settings import (
-    HeadConfig,
+    HeadMode,
     LossConfig,
     ModelConfig,
     PhaseConfig,
@@ -29,7 +35,7 @@ from intent_classifier.settings import (
     load_model_config,
     load_train_config,
 )
-from intent_classifier.utils import ensure_dir, save_json, set_seed
+from intent_classifier.utils import ensure_dir, load_json, save_json, set_seed, sha256_file
 
 logger = logging.getLogger(__name__)
 
@@ -83,7 +89,7 @@ def compute_multihead_loss(
     losses: list[torch.Tensor] = []
     for head in config.heads:
         weight = loss_config.head_weights.get(head.name, 1.0)
-        if head.mode == "multi_label":
+        if head.mode == HeadMode.MULTI_LABEL:
             pos_weight = None
             if pos_weights and head.name in pos_weights:
                 pos_weight = pos_weights[head.name].to(logits[head.name].device)
@@ -106,10 +112,16 @@ def compute_pos_weights(
     config: ModelConfig,
     max_pos_weight: float = 10.0,
 ) -> dict[str, torch.Tensor]:
+    """Compute BCE positive-label weights to reduce rare-label under-training.
+
+    Multi-label datasets are usually sparse: most labels are negative in most rows. For each
+    multi-label output, `pos_weight = negatives / positives` tells BCEWithLogitsLoss to penalize
+    missed positives more heavily. The cap keeps rare labels from destabilizing training.
+    """
     weights: dict[str, torch.Tensor] = {}
     frame = dataset.frame
     for head in config.heads:
-        if head.mode != "multi_label":
+        if head.mode != HeadMode.MULTI_LABEL:
             continue
         values = []
         for label in head.labels:
@@ -130,7 +142,7 @@ def compute_metrics(
     for head in config.heads:
         head_logits = logits[head.name]
         head_labels = labels[head.name]
-        if head.mode == "multi_label":
+        if head.mode == HeadMode.MULTI_LABEL:
             probs = sigmoid(head_logits)
             threshold_values = np.array(
                 [
@@ -185,6 +197,12 @@ def compute_metrics(
                     "support": int(support[index]),
                 }
         metrics["heads"][head.name] = head_metrics
+    metrics["mean_macro_f1"] = float(
+        np.mean([head_metrics["macro_f1"] for head_metrics in metrics["heads"].values()])
+    )
+    metrics["mean_weighted_f1"] = float(
+        np.mean([head_metrics["weighted_f1"] for head_metrics in metrics["heads"].values()])
+    )
     return metrics
 
 
@@ -219,6 +237,30 @@ def train_one_epoch(
 
 
 @torch.no_grad()
+def collect_logits_and_labels(
+    model: TextClassifier,
+    loader: DataLoader[dict[str, Any]],
+    config: ModelConfig,
+    device: torch.device,
+) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray]]:
+    model.eval()
+    logits_store = {head.name: [] for head in config.heads}
+    labels_store = {head.name: [] for head in config.heads}
+    for batch in loader:
+        logits = model(
+            input_ids=batch["input_ids"].to(device),
+            attention_mask=batch["attention_mask"].to(device),
+        )
+        for head in config.heads:
+            logits_store[head.name].append(logits[head.name].detach().cpu().numpy())
+            labels_store[head.name].append(batch["labels"][head.name].detach().cpu().numpy())
+    return (
+        {name: np.concatenate(values, axis=0) for name, values in logits_store.items()},
+        {name: np.concatenate(values, axis=0) for name, values in labels_store.items()},
+    )
+
+
+@torch.no_grad()
 def evaluate(
     model: TextClassifier,
     loader: DataLoader[dict[str, Any]],
@@ -228,8 +270,6 @@ def evaluate(
 ) -> dict[str, Any]:
     model.eval()
     losses = []
-    logits_store = {head.name: [] for head in config.heads}
-    labels_store = {head.name: [] for head in config.heads}
     for batch in loader:
         logits = model(
             input_ids=batch["input_ids"].to(device),
@@ -237,21 +277,26 @@ def evaluate(
         )
         loss = compute_multihead_loss(logits, batch["labels"], config, loss_config)
         losses.append(float(loss.detach().cpu()))
-        for head in config.heads:
-            logits_store[head.name].append(logits[head.name].detach().cpu().numpy())
-            labels_store[head.name].append(batch["labels"][head.name].detach().cpu().numpy())
 
-    logits_np = {name: np.concatenate(values, axis=0) for name, values in logits_store.items()}
-    labels_np = {name: np.concatenate(values, axis=0) for name, values in labels_store.items()}
+    logits_np, labels_np = collect_logits_and_labels(model, loader, config, device)
     metrics = compute_metrics(logits_np, labels_np, config)
     metrics["loss"] = float(np.mean(losses)) if losses else 0.0
     return metrics
 
 
 def fit(train_config: TrainConfig, model_config: ModelConfig) -> TextClassifier:
+    model, _ = _fit_with_reports(train_config, model_config, export_artifacts=True)
+    return model
+
+
+def _fit_with_reports(
+    train_config: TrainConfig,
+    model_config: ModelConfig,
+    export_artifacts: bool,
+) -> tuple[TextClassifier, dict[str, Any]]:
     set_seed(train_config.seed)
     artifact_dir = ensure_dir(train_config.artifact_dir)
-    tokenizer_dir = export_tokenizer(model_config.backbone)
+    tokenizer_dir = export_tokenizer(model_config.backbone, artifact_dir / "tokenizer")
     tokenizer = load_tokenizer(tokenizer_dir)
     dataset = RequestDataset.from_csv(train_config.dataset_csv, model_config)
     splits = split_ids(dataset.frame, train_config.splits, train_config.seed)
@@ -264,8 +309,13 @@ def fit(train_config: TrainConfig, model_config: ModelConfig) -> TextClassifier:
     )
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = create_model(model_config).to(device)
-    pos_weights = compute_pos_weights(dataset, model_config, train_config.loss.max_pos_weight)
+    pos_weights = (
+        compute_pos_weights(dataset, model_config, train_config.loss.max_pos_weight)
+        if train_config.loss.use_pos_weights
+        else None
+    )
 
+    best_validation: dict[str, Any] | None = None
     for phase in (train_config.training.phase_1, train_config.training.phase_2):
         model.freeze_backbone() if phase.freeze_backbone else model.unfreeze_backbone()
         optimizer = create_optimizer(model, phase, train_config.training.weight_decay)
@@ -290,6 +340,7 @@ def fit(train_config: TrainConfig, model_config: ModelConfig) -> TextClassifier:
                 train_config.loss,
                 device,
             )
+            best_validation = validation_metrics
             logger.info(
                 "phase freeze=%s epoch=%s train_loss=%.4f validation_loss=%.4f",
                 phase.freeze_backbone,
@@ -298,9 +349,43 @@ def fit(train_config: TrainConfig, model_config: ModelConfig) -> TextClassifier:
                 validation_metrics["loss"],
             )
 
-    save_checkpoint(model, artifact_dir / "checkpoint.pt", model_config)
-    export_onnx(model, model_config, artifact_dir / "model.onnx", device=device)
-    return model
+    validation_logits, validation_labels = collect_logits_and_labels(
+        model,
+        loaders["validation"],
+        model_config,
+        device,
+    )
+    validation_probs = {
+        head_name: sigmoid(values) for head_name, values in validation_logits.items()
+    }
+    calibration = calibrate_outputs(validation_logits, validation_labels, model_config)
+    thresholds = tune_thresholds(validation_probs, validation_labels, model_config)
+    test_metrics = evaluate(model, loaders["test"], model_config, train_config.loss, device)
+    report = {
+        "validation": best_validation or {},
+        "test": test_metrics,
+        "dataset": {
+            "csv_path": str(train_config.dataset_csv),
+            "csv_sha256": sha256_file(train_config.dataset_csv),
+            **compute_label_distributions(dataset.frame, model_config),
+            "split_rows": {
+                "train": len(splits.train),
+                "validation": len(splits.validation),
+                "test": len(splits.test),
+            },
+        },
+    }
+
+    if export_artifacts:
+        save_checkpoint(model, artifact_dir / "checkpoint.pt", model_config)
+        save_runtime_configs(model_config, train_config, artifact_dir)
+        save_calibration(calibration, artifact_dir / "calibration.json")
+        save_thresholds(thresholds, artifact_dir / "thresholds.json")
+        save_json(report, artifact_dir / "evaluation_report.json")
+        onnx_path = export_onnx(model, model_config, artifact_dir / "model.onnx", device=device)
+        quantize_onnx(onnx_path, artifact_dir / "model.int8.onnx")
+        update_changelog(train_config.artifacts_root / "changelog.yaml", artifact_dir, report)
+    return model, report
 
 
 def save_checkpoint(model: TextClassifier, path: str | Path, config: ModelConfig) -> Path:
@@ -316,21 +401,134 @@ def load_checkpoint(model: TextClassifier, path: str | Path, map_location: str =
     return model
 
 
-def objective(trial: optuna.Trial, train_config: TrainConfig, model_config: ModelConfig) -> float:
-    dropout = trial.suggest_float("dropout", 0.1, 0.3)
-    logger.info("Optuna trial requested dropout=%s; full retraining hook is project-specific", dropout)
-    _ = train_config, model_config
-    return 0.0
+def objective(
+    trial: optuna.Trial,
+    train_config: TrainConfig,
+    model_config: ModelConfig,
+    hpo_dir: str | Path,
+) -> float:
+    trial_train_config, trial_model_config = build_trial_configs(
+        trial,
+        train_config,
+        model_config,
+        hpo_dir,
+    )
+    _, report = _fit_with_reports(trial_train_config, trial_model_config, export_artifacts=False)
+    metric_name = train_config.optuna.metric
+    value = float(report["validation"].get(metric_name, report["validation"].get("mean_macro_f1", 0.0)))
+    trial.set_user_attr("train_config", trial_train_config.model_dump(mode="json"))
+    trial.set_user_attr("model_config", trial_model_config.model_dump(mode="json"))
+    return value
+
+
+def build_trial_configs(
+    trial: optuna.Trial,
+    train_config: TrainConfig,
+    model_config: ModelConfig,
+    hpo_dir: str | Path | None = None,
+) -> tuple[TrainConfig, ModelConfig]:
+    space = train_config.optuna.search_space
+    trial_number = int(getattr(trial, "number", 0))
+    dropout = trial.suggest_float("dropout", *space.dropout)
+    max_length = trial.suggest_categorical("max_length", list(space.max_length))
+    batch_size = trial.suggest_categorical("batch_size", list(space.batch_size))
+    weight_decay = trial.suggest_float("weight_decay", *space.weight_decay)
+    lr_backbone = trial.suggest_float("learning_rate_backbone", *space.learning_rate_backbone, log=True)
+    lr_classifier = trial.suggest_float(
+        "learning_rate_classifier",
+        *space.learning_rate_classifier,
+        log=True,
+    )
+    max_pos_weight = trial.suggest_float("max_pos_weight", *space.max_pos_weight)
+    head_updates = []
+    for head in model_config.heads:
+        hidden_size = trial.suggest_categorical(
+            f"{head.name}_hidden_size",
+            list(space.head_hidden_sizes),
+        )
+        head_updates.append(
+            head.model_copy(
+                update={"hidden_layer": head.hidden_layer.model_copy(update={"size": hidden_size})}
+            )
+        )
+    trial_model_config = model_config.model_copy(
+        update={
+            "classifier": model_config.classifier.model_copy(update={"dropout": dropout}),
+            "text": model_config.text.model_copy(update={"max_length": max_length}),
+            "heads": tuple(head_updates),
+        }
+    )
+    phase_1 = train_config.training.phase_1.model_copy(
+        update={"batch_size": batch_size, "learning_rate_classifier": lr_classifier}
+    )
+    phase_2 = train_config.training.phase_2.model_copy(
+        update={
+            "batch_size": batch_size,
+            "learning_rate_classifier": lr_classifier,
+            "learning_rate_backbone": lr_backbone,
+        }
+    )
+    trial_train_config = train_config.model_copy(
+        update={
+            "artifact_dir": make_hpo_artifact_dir(hpo_dir or train_config.artifacts_root, trial_number),
+            "training": train_config.training.model_copy(
+                update={
+                    "phase_1": phase_1,
+                    "phase_2": phase_2,
+                    "weight_decay": weight_decay,
+                }
+            ),
+            "loss": train_config.loss.model_copy(update={"max_pos_weight": max_pos_weight}),
+        }
+    )
+    return trial_train_config, trial_model_config
 
 
 def run_optuna_study(train_config: TrainConfig, model_config: ModelConfig) -> optuna.Study:
+    hpo_dir = create_hpo_run_dir(train_config.artifacts_root)
     study = optuna.create_study(direction="maximize")
-    study.optimize(lambda trial: objective(trial, train_config, model_config), n_trials=train_config.optuna.n_trials)
+    study.set_user_attr("hpo_dir", str(hpo_dir))
+    study.optimize(
+        lambda trial: objective(trial, train_config, model_config, hpo_dir),
+        n_trials=train_config.optuna.n_trials,
+    )
+    save_study(study, hpo_dir / "study.json")
     return study
 
 
-def train_study(train_config: TrainConfig, model_config: ModelConfig) -> optuna.Study:
-    return run_optuna_study(train_config, model_config)
+def save_study(study: optuna.Study, path: str | Path) -> None:
+    payload = {
+        "study_name": study.study_name,
+        "direction": study.direction.name,
+        "best_trial_number": study.best_trial.number if study.trials else None,
+        "best_params": study.best_params if study.trials else {},
+        "best_value": study.best_value if study.trials else None,
+        "user_attrs": study.user_attrs,
+        "trials": [_trial_to_json(trial) for trial in study.trials],
+    }
+    save_json(payload, path)
+
+
+def load_study(path: str | Path) -> optuna.Study:
+    payload = load_json(path)
+    direction = payload.get("direction", "MAXIMIZE").lower()
+    study = optuna.create_study(direction=direction)
+    for key, value in payload.get("user_attrs", {}).items():
+        study.set_user_attr(key, value)
+    for trial_payload in payload.get("trials", []):
+        study.add_trial(_trial_from_json(trial_payload))
+    return study
+
+
+def train_study(study_json: str | Path, train_config: TrainConfig, model_config: ModelConfig) -> TextClassifier:
+    study_data = load_json(study_json)
+    params = study_data.get("best_params")
+    if not params:
+        raise ValueError(f"No best_params found in study JSON: {study_json}")
+    fixed_trial = optuna.trial.FixedTrial(params)
+    final_train_config, final_model_config = build_trial_configs(fixed_trial, train_config, model_config)
+    final_train_config = final_train_config.model_copy(update={"artifact_dir": train_config.artifact_dir})
+    return fit(final_train_config, final_model_config)
 
 
 def quantize_onnx(input_path: str | Path, output_path: str | Path) -> Path:
@@ -347,16 +545,14 @@ def calibrate_outputs(
 ) -> dict[str, Any]:
     calibration: dict[str, Any] = {
         "version": "calibration_v1",
-        "fitted_on": "logits",
+        "fitted_on": "validation_logits",
         "heads": {},
     }
     for head in config.heads:
-        if head.mode == "multi_label":
+        if head.mode == HeadMode.MULTI_LABEL:
             calibration["heads"][head.name] = {
                 "method": "per_label_temperature_scaling",
-                "temperatures": {
-                    label: 1.0 for label in head.labels
-                },
+                "temperatures": {label: 1.0 for label in head.labels},
             }
         else:
             calibration["heads"][head.name] = {
@@ -372,8 +568,6 @@ def save_calibration(calibration: dict[str, Any], path: str | Path) -> None:
 
 
 def load_calibration(path: str | Path) -> dict[str, Any]:
-    from intent_classifier.utils import load_json
-
     return load_json(path)
 
 
@@ -386,7 +580,7 @@ def tune_thresholds(
     grid = candidates if candidates is not None else np.linspace(0.1, 0.9, 17)
     thresholds: dict[str, Any] = {"version": "thresholds_v1", "heads": {}}
     for head in config.heads:
-        if head.mode != "multi_label":
+        if head.mode != HeadMode.MULTI_LABEL:
             continue
         thresholds["heads"][head.name] = {}
         for index, label in enumerate(head.labels):
@@ -408,8 +602,6 @@ def save_thresholds(thresholds: dict[str, Any], path: str | Path) -> None:
 
 
 def load_thresholds(path: str | Path) -> dict[str, Any]:
-    from intent_classifier.utils import load_json
-
     return load_json(path)
 
 
@@ -421,21 +613,122 @@ def plot_training_history(history: dict[str, Any], output_path: str | Path) -> P
     return output
 
 
+def create_hpo_run_dir(artifacts_root: str | Path) -> Path:
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return ensure_dir(Path(artifacts_root) / "hpo" / timestamp)
+
+
+def make_hpo_artifact_dir(hpo_dir: str | Path, trial_number: int) -> Path:
+    return Path(hpo_dir) / "artifacts" / f"trial_{trial_number:04d}"
+
+
+def next_version_artifact_dir(artifacts_root: str | Path) -> Path:
+    root = ensure_dir(artifacts_root)
+    versions = [
+        int(path.name[1:])
+        for path in root.iterdir()
+        if path.is_dir() and path.name.startswith("v") and path.name[1:].isdigit()
+    ]
+    next_version = max(versions, default=0) + 1
+    return root / f"v{next_version}"
+
+
+def save_runtime_configs(
+    model_config: ModelConfig,
+    train_config: TrainConfig,
+    artifact_dir: str | Path,
+) -> None:
+    output = ensure_dir(artifact_dir)
+    with (output / "model_config.yaml").open("w", encoding="utf-8") as file:
+        yaml.safe_dump(model_config.model_dump(mode="json"), file, sort_keys=False, allow_unicode=True)
+    with (output / "train_config.yaml").open("w", encoding="utf-8") as file:
+        yaml.safe_dump(train_config.model_dump(mode="json"), file, sort_keys=False, allow_unicode=True)
+
+
+def update_changelog(changelog_path: str | Path, artifact_dir: str | Path, report: dict[str, Any]) -> None:
+    path = Path(changelog_path)
+    if path.exists():
+        with path.open("r", encoding="utf-8") as file:
+            changelog = yaml.safe_load(file) or {}
+    else:
+        changelog = {}
+    version = Path(artifact_dir).name
+    changelog[version] = {
+        "artifact_dir": str(artifact_dir),
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+        "dataset": report.get("dataset", {}),
+        "metrics": report.get("test", {}),
+    }
+    ensure_dir(path.parent)
+    with path.open("w", encoding="utf-8") as file:
+        yaml.safe_dump(changelog, file, sort_keys=False, allow_unicode=True)
+
+
 def sigmoid(values: np.ndarray) -> np.ndarray:
     return 1.0 / (1.0 + np.exp(-values))
 
 
+def _trial_to_json(trial: optuna.trial.FrozenTrial) -> dict[str, Any]:
+    return {
+        "number": trial.number,
+        "state": trial.state.name,
+        "value": trial.value,
+        "params": trial.params,
+        "distributions": {
+            name: distribution_to_json(distribution)
+            for name, distribution in trial.distributions.items()
+        },
+        "user_attrs": trial.user_attrs,
+    }
+
+
+def _trial_from_json(payload: dict[str, Any]) -> optuna.trial.FrozenTrial:
+    distributions = {
+        name: json_to_distribution(distribution_json)
+        for name, distribution_json in payload.get("distributions", {}).items()
+    }
+    return optuna.trial.create_trial(
+        params=payload.get("params", {}),
+        distributions=distributions,
+        value=payload.get("value"),
+        user_attrs=payload.get("user_attrs", {}),
+        state=getattr(optuna.trial.TrialState, payload.get("state", "COMPLETE")),
+    )
+
+
 def main() -> None:
+    """Run training or HPO from the command line.
+
+    Examples:
+        uv run python -m intent_classifier.train --config intent_classifier/config/train_config.yaml
+        uv run python -m intent_classifier.train --config intent_classifier/config/train_config.yaml --hpo
+        uv run python -m intent_classifier.train --config intent_classifier/config/train_config.yaml --study-json intent_classifier/artifacts/hpo/20260101_120000/study.json
+    """
     parser = argparse.ArgumentParser(description="Train the intent classifier.")
     parser.add_argument("--config", default="intent_classifier/config/train_config.yaml")
+    parser.add_argument("--hpo", action="store_true", help="Run Optuna HPO instead of normal training.")
+    parser.add_argument(
+        "--study-json",
+        default=None,
+        help="Train final model using the best params from a saved study JSON.",
+    )
+    parser.add_argument(
+        "--artifact-dir",
+        default=None,
+        help="Override artifact directory. Use this for explicit vN output paths.",
+    )
     args = parser.parse_args()
     train_config = load_train_config(args.config)
-    model_config = load_model_config(train_config.model_config)
-    if train_config.optuna.enabled:
+    model_config = load_model_config(train_config.model_config_path)
+    if args.artifact_dir:
+        train_config = train_config.model_copy(update={"artifact_dir": Path(args.artifact_dir)})
+    if args.hpo:
         run_optuna_study(train_config, model_config)
-    fit(train_config, model_config)
+    elif args.study_json:
+        train_study(args.study_json, train_config, model_config)
+    else:
+        fit(train_config, model_config)
 
 
 if __name__ == "__main__":
     main()
-

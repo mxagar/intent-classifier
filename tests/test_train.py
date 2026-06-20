@@ -1,8 +1,15 @@
 import numpy as np
+import optuna
 import torch
 
-from intent_classifier.settings import LossConfig, load_model_config
-from intent_classifier.train import compute_metrics, compute_multihead_loss, tune_thresholds
+from intent_classifier.settings import LossConfig, load_model_config, load_train_config
+from intent_classifier.train import (
+    compute_metrics,
+    compute_multihead_loss,
+    load_study,
+    save_study,
+    tune_thresholds,
+)
 
 
 def test_compute_multihead_loss() -> None:
@@ -48,3 +55,23 @@ def test_compute_metrics_and_thresholds() -> None:
     assert metrics["heads"]["business"]["micro_f1"] == 1.0
     assert thresholds["heads"]["business"]["create_budget"]["activate"] == 0.5
 
+
+def test_train_config_has_no_calibration_split() -> None:
+    train_config = load_train_config("intent_classifier/config/train_config.yaml")
+
+    assert train_config.splits.train == 0.8
+    assert train_config.splits.validation == 0.1
+    assert train_config.splits.test == 0.1
+    assert not hasattr(train_config.splits, "calibration")
+
+
+def test_save_and_load_study_json(tmp_path) -> None:
+    study = optuna.create_study(direction="maximize")
+    study.optimize(lambda trial: trial.suggest_float("x", 0.0, 1.0), n_trials=1)
+    path = tmp_path / "study.json"
+
+    save_study(study, path)
+    loaded = load_study(path)
+
+    assert len(loaded.trials) == 1
+    assert loaded.best_params.keys() == study.best_params.keys()

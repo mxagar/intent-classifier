@@ -1,12 +1,11 @@
 seed: 42
-dataset_csv: dataset/train.csv
+dataset_csv: dataset/example_dataset.csv
 model_config: intent_classifier/config/model_config.yaml
 artifact_dir: intent_classifier/artifacts/v1
 
 splits:
-  train: 0.7
+  train: 0.8
   validation: 0.1
-  calibration: 0.1
   test: 0.1
   group_column: null
 
@@ -31,8 +30,18 @@ loss:
     business: 1.0
     undesired: 1.5
   max_pos_weight: 10.0
+  use_pos_weights: true
 
 optuna:
   enabled: false
   n_trials: 30
-
+  metric: mean_macro_f1
+  search_space:
+    dropout: [0.1, 0.4]
+    max_length: [64, 128, 256]
+    batch_size: [8, 16, 32]
+    weight_decay: [0.0, 0.05]
+    learning_rate_backbone: [0.00001, 0.00005]
+    learning_rate_classifier: [0.0001, 0.001]
+    max_pos_weight: [2.0, 15.0]
+    head_hidden_sizes: [64, 128, 256, 384]

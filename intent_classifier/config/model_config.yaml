@@ -16,7 +16,7 @@ heads:
     mode: multi_label
     hidden_layer:
       size: 256
-      activation: gelu
+      activation: relu
     labels:
       - create_budget
       - create_invoice
@@ -33,7 +33,7 @@ heads:
     mode: multi_label
     hidden_layer:
       size: 128
-      activation: gelu
+      activation: relu
     labels:
       - prompt_injection
       - abuse
@@ -43,4 +43,3 @@ heads:
       - unsupported_request
       - irrelevant_request
       - ambiguous_request
-

@@ -1,6 +1,5 @@
 """Standalone evaluation entry point."""
 
-from __future__ import annotations
 
 import argparse
 import logging
@@ -20,7 +19,7 @@ def run_evaluation(config_path: str | Path) -> dict[str, object]:
     `intent_classifier.train.evaluate`.
     """
     train_config = load_train_config(config_path)
-    model_config = load_model_config(train_config.model_config)
+    model_config = load_model_config(train_config.model_config_path)
     report = {
         "status": "not_run",
         "reason": "Load a trained checkpoint and data loader to call train.evaluate.",
@@ -32,6 +31,11 @@ def run_evaluation(config_path: str | Path) -> dict[str, object]:
 
 
 def main() -> None:
+    """Run standalone artifact evaluation.
+
+    Example:
+        uv run python -m intent_classifier.evaluate --config intent_classifier/config/train_config.yaml
+    """
     parser = argparse.ArgumentParser(description="Evaluate trained intent classifier artifacts.")
     parser.add_argument("--config", default="intent_classifier/config/train_config.yaml")
     args = parser.parse_args()
@@ -41,4 +45,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

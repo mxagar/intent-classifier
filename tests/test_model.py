@@ -28,7 +28,7 @@ def test_text_classifier_outputs_configured_heads(monkeypatch) -> None:
         attention_mask=torch.ones((2, 4), dtype=torch.long),
     )
 
-    assert set(outputs) == {"business", "undesired"}
+    assert set(outputs) == {"business", "undesired", "features"}
     assert outputs["business"].shape == (2, 10)
     assert outputs["undesired"].shape == (2, 8)
-
+    assert outputs["features"].shape == (2, 6)

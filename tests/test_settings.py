@@ -31,13 +31,13 @@ heads:
     mode: multi_label
     hidden_layer:
       size: 4
-      activation: gelu
+      activation: relu
     labels: [a]
   - name: business
     mode: multi_label
     hidden_layer:
       size: 4
-      activation: gelu
+      activation: relu
     labels: [b]
 """,
         encoding="utf-8",

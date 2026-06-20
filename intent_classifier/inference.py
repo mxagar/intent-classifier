@@ -1,6 +1,5 @@
 """Runtime prediction helpers and ONNX-backed estimator."""
 
-from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
@@ -12,8 +11,7 @@ import torch
 
 from intent_classifier.model import TextClassifier, load_onnx, postprocess_onnx_outputs
 from intent_classifier.preprocessing import load_tokenizer, tokenize_texts
-from intent_classifier.settings import HeadConfig, ModelConfig, load_model_config
-from intent_classifier.train import load_calibration, load_thresholds
+from intent_classifier.settings import HeadConfig, HeadMode, ModelConfig, load_model_config
 from intent_classifier.utils import load_json, text_hash
 
 logger = logging.getLogger(__name__)
@@ -132,7 +130,7 @@ def postprocess_predictions(
         probabilities = {label: float(probs[index]) for index, label in enumerate(head.labels)}
         active = _active_labels_for_head(probs, head, thresholds)
         predictions[head.name] = HeadPrediction(
-            mode=head.mode,
+            mode=head.mode.value,
             probabilities=probabilities,
             active_labels=active,
         )
@@ -145,7 +143,7 @@ def _probabilities_for_head(
     calibration: dict[str, Any],
 ) -> np.ndarray:
     head_calibration = calibration.get("heads", {}).get(head.name, {})
-    if head.mode == "multi_label":
+    if head.mode == HeadMode.MULTI_LABEL:
         temperatures = head_calibration.get("temperatures", {})
         temp_values = np.array([float(temperatures.get(label, 1.0)) for label in head.labels])
         return sigmoid(logits / temp_values)
@@ -158,7 +156,7 @@ def _active_labels_for_head(
     head: HeadConfig,
     thresholds: dict[str, Any],
 ) -> list[str]:
-    if head.mode == "single_label":
+    if head.mode == HeadMode.SINGLE_LABEL:
         return [head.labels[int(np.argmax(probabilities))]]
     head_thresholds = thresholds.get("heads", {}).get(head.name, {})
     active = []
@@ -177,4 +175,3 @@ def softmax(values: np.ndarray) -> np.ndarray:
     shifted = values - np.max(values)
     exp = np.exp(shifted)
     return exp / exp.sum()
-

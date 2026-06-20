@@ -1,7 +1,5 @@
 """CSV dataset validation, target construction, splitting, and batching."""
 
-from __future__ import annotations
-
 import logging
 from dataclasses import dataclass
 from pathlib import Path
@@ -19,6 +17,7 @@ from intent_classifier.settings import (
     ALLOWED_DOMAINS,
     ALLOWED_ORIGINS,
     HeadConfig,
+    HeadMode,
     ModelConfig,
     SplitConfig,
 )
@@ -32,7 +31,6 @@ REQUIRED_COLUMNS = ("id", "text", "origin", "domain")
 class DatasetSplits:
     train: list[int]
     validation: list[int]
-    calibration: list[int]
     test: list[int]
 
 
@@ -102,7 +100,7 @@ def build_targets_for_row(row: pd.Series, config: ModelConfig) -> dict[str, torc
     labels: dict[str, torch.Tensor] = {}
     for head in config.heads:
         values = [int(row[f"{head.name}__{label}"]) for label in head.labels]
-        if head.mode == "multi_label":
+        if head.mode == HeadMode.MULTI_LABEL:
             labels[head.name] = torch.tensor(values, dtype=torch.float32)
         else:
             labels[head.name] = torch.tensor(int(np.argmax(values)), dtype=torch.long)
@@ -161,13 +159,6 @@ def create_data_loaders(
             num_workers=num_workers,
             collate_fn=collate,
         ),
-        "calibration": DataLoader(
-            Subset(dataset, splits.calibration),
-            batch_size=batch_size,
-            shuffle=False,
-            num_workers=num_workers,
-            collate_fn=collate,
-        ),
         "test": DataLoader(
             Subset(dataset, splits.test),
             batch_size=batch_size,
@@ -188,26 +179,17 @@ def split_ids(frame: pd.DataFrame, split_config: SplitConfig, seed: int = 42) ->
         shuffle=True,
         stratify=stratify,
     )
-    remainder_fraction = split_config.validation + split_config.calibration + split_config.test
+    remainder_fraction = split_config.validation + split_config.test
     validation_fraction = split_config.validation / remainder_fraction
-    validation_idx, calibration_test_idx = train_test_split(
+    validation_idx, test_idx = train_test_split(
         remainder_idx,
         train_size=validation_fraction,
-        random_state=seed,
-        shuffle=True,
-    )
-    calibration_test_fraction = split_config.calibration + split_config.test
-    calibration_fraction = split_config.calibration / calibration_test_fraction
-    calibration_idx, test_idx = train_test_split(
-        calibration_test_idx,
-        train_size=calibration_fraction,
         random_state=seed,
         shuffle=True,
     )
     return DatasetSplits(
         train=sorted(train_idx),
         validation=sorted(validation_idx),
-        calibration=sorted(calibration_idx),
         test=sorted(test_idx),
     )
 
@@ -235,7 +217,7 @@ def show_batch(batch: dict[str, Any], max_examples: int = 3) -> str:
 
 def _validate_head_targets(frame: pd.DataFrame, head: HeadConfig) -> None:
     columns = list(head.label_columns)
-    if head.mode == "single_label":
+    if head.mode == HeadMode.SINGLE_LABEL:
         positives = frame[columns].sum(axis=1)
         invalid_count = int((positives != 1).sum())
         if invalid_count:
@@ -247,4 +229,3 @@ def _validate_head_targets(frame: pd.DataFrame, head: HeadConfig) -> None:
 
 def _value_counts(series: pd.Series) -> dict[str, int]:
     return {str(key): int(value) for key, value in series.value_counts().sort_index().items()}
-

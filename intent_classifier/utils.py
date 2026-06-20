@@ -1,6 +1,5 @@
 """Shared utilities for reproducibility, logging, hashing, and JSON IO."""
 
-from __future__ import annotations
 
 import hashlib
 import json
@@ -39,6 +38,10 @@ def sha256_file(path: str | Path) -> str:
 
 
 def text_hash(text: str) -> str:
+    """Hash raw user text for privacy-preserving prediction logs.
+
+    This lets production logs correlate repeated messages without storing the raw text itself.
+    """
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
@@ -62,4 +65,3 @@ def load_json(path: str | Path) -> dict[str, Any]:
     if not isinstance(data, dict):
         raise ValueError(f"Expected JSON object in {path}")
     return data
-

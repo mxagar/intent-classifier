@@ -1,64 +1,95 @@
-"""Typed configuration loading and validation."""
+"""Typed configuration loading and validation with Pydantic."""
 
-from __future__ import annotations
-
-from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any
 
 import yaml
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-HeadMode = Literal["multi_label", "single_label"]
-ActivationName = Literal["gelu", "relu", "tanh"]
-PaddingMode = Literal["max_length", "longest", "do_not_pad"]
+
+class HeadMode(str, Enum):
+    MULTI_LABEL = "multi_label"
+    SINGLE_LABEL = "single_label"
+
+
+class ActivationName(str, Enum):
+    RELU = "relu"
+    GELU = "gelu"
+    TANH = "tanh"
+
+
+class PaddingMode(str, Enum):
+    MAX_LENGTH = "max_length"
+    LONGEST = "longest"
+    DO_NOT_PAD = "do_not_pad"
+
 
 ALLOWED_ORIGINS = {"synthetic", "manual", "production", "unknown"}
 ALLOWED_DOMAINS = {"general", "electricista", "fontanero", "albañil", "carpintero", "unknown"}
 
 
-@dataclass(frozen=True)
-class BackboneConfig:
+class FrozenConfigModel(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid", populate_by_name=True)
+
+
+class BackboneConfig(FrozenConfigModel):
     name: str
-    revision: str
+    revision: str = "main"
     local_tokenizer_path: Path
 
 
-@dataclass(frozen=True)
-class TextConfig:
-    max_length: int = 128
+class TextConfig(FrozenConfigModel):
+    max_length: int = Field(default=128, gt=0)
     truncation: bool = True
-    padding: PaddingMode = "max_length"
+    padding: PaddingMode = PaddingMode.MAX_LENGTH
 
 
-@dataclass(frozen=True)
-class ClassifierConfig:
-    dropout: float = 0.2
+class ClassifierConfig(FrozenConfigModel):
+    dropout: float = Field(default=0.2, ge=0.0, lt=1.0)
 
 
-@dataclass(frozen=True)
-class HiddenLayerConfig:
-    size: int
-    activation: ActivationName = "gelu"
+class HiddenLayerConfig(FrozenConfigModel):
+    size: int = Field(gt=0)
+    activation: ActivationName = ActivationName.RELU
 
 
-@dataclass(frozen=True)
-class HeadConfig:
+class HeadConfig(FrozenConfigModel):
     name: str
     mode: HeadMode
     hidden_layer: HiddenLayerConfig
     labels: tuple[str, ...]
+
+    @field_validator("labels")
+    @classmethod
+    def labels_must_be_unique(cls, labels: tuple[str, ...]) -> tuple[str, ...]:
+        duplicates = sorted({label for label in labels if labels.count(label) > 1})
+        if duplicates:
+            raise ValueError(f"Duplicate labels: {duplicates}")
+        if not labels:
+            raise ValueError("At least one label is required")
+        return labels
 
     @property
     def label_columns(self) -> tuple[str, ...]:
         return tuple(f"{self.name}__{label}" for label in self.labels)
 
 
-@dataclass(frozen=True)
-class ModelConfig:
+class ModelConfig(FrozenConfigModel):
     backbone: BackboneConfig
-    text: TextConfig
-    classifier: ClassifierConfig
+    text: TextConfig = TextConfig()
+    classifier: ClassifierConfig = ClassifierConfig()
     heads: tuple[HeadConfig, ...]
+
+    @model_validator(mode="after")
+    def heads_must_be_unique(self) -> "ModelConfig":
+        names = [head.name for head in self.heads]
+        duplicates = sorted({name for name in names if names.count(name) > 1})
+        if duplicates:
+            raise ValueError(f"Duplicate head names: {duplicates}")
+        if not self.heads:
+            raise ValueError("At least one head is required")
+        return self
 
     @property
     def head_names(self) -> tuple[str, ...]:
@@ -75,55 +106,73 @@ class ModelConfig:
         raise KeyError(f"Unknown head: {name}")
 
 
-@dataclass(frozen=True)
-class SplitConfig:
-    train: float = 0.7
-    validation: float = 0.1
-    calibration: float = 0.1
-    test: float = 0.1
+class SplitConfig(FrozenConfigModel):
+    train: float = Field(default=0.8, gt=0.0, lt=1.0)
+    validation: float = Field(default=0.1, gt=0.0, lt=1.0)
+    test: float = Field(default=0.1, gt=0.0, lt=1.0)
     group_column: str | None = None
 
+    @model_validator(mode="after")
+    def fractions_must_sum_to_one(self) -> "SplitConfig":
+        total = self.train + self.validation + self.test
+        if abs(total - 1.0) > 1e-6:
+            raise ValueError(f"Split fractions must sum to 1.0, got {total}")
+        return self
 
-@dataclass(frozen=True)
-class PhaseConfig:
+
+class PhaseConfig(FrozenConfigModel):
     freeze_backbone: bool
-    epochs: int
-    learning_rate_classifier: float
-    batch_size: int
-    learning_rate_backbone: float | None = None
+    epochs: int = Field(ge=0)
+    learning_rate_classifier: float = Field(gt=0.0)
+    batch_size: int = Field(gt=0)
+    learning_rate_backbone: float | None = Field(default=None, gt=0.0)
 
 
-@dataclass(frozen=True)
-class TrainingConfig:
+class TrainingConfig(FrozenConfigModel):
     phase_1: PhaseConfig
     phase_2: PhaseConfig
-    weight_decay: float = 0.01
-    gradient_clipping: float = 1.0
-    early_stopping_patience: int = 3
+    weight_decay: float = Field(default=0.01, ge=0.0)
+    gradient_clipping: float | None = Field(default=1.0, gt=0.0)
+    early_stopping_patience: int = Field(default=3, ge=0)
 
 
-@dataclass(frozen=True)
-class LossConfig:
-    head_weights: dict[str, float]
-    max_pos_weight: float = 10.0
+class LossConfig(FrozenConfigModel):
+    head_weights: dict[str, float] = Field(default_factory=dict)
+    max_pos_weight: float = Field(default=10.0, gt=0.0)
+    use_pos_weights: bool = True
 
 
-@dataclass(frozen=True)
-class OptunaConfig:
+class HpoSearchSpace(FrozenConfigModel):
+    dropout: tuple[float, float] = (0.1, 0.4)
+    max_length: tuple[int, ...] = (64, 128, 256)
+    batch_size: tuple[int, ...] = (8, 16, 32)
+    weight_decay: tuple[float, float] = (0.0, 0.05)
+    learning_rate_backbone: tuple[float, float] = (1e-5, 5e-5)
+    learning_rate_classifier: tuple[float, float] = (1e-4, 1e-3)
+    max_pos_weight: tuple[float, float] = (2.0, 15.0)
+    head_hidden_sizes: tuple[int, ...] = (64, 128, 256, 384)
+
+
+class OptunaConfig(FrozenConfigModel):
     enabled: bool = False
-    n_trials: int = 30
+    n_trials: int = Field(default=30, gt=0)
+    metric: str = "mean_macro_f1"
+    search_space: HpoSearchSpace = HpoSearchSpace()
 
 
-@dataclass(frozen=True)
-class TrainConfig:
-    seed: int
+class TrainConfig(FrozenConfigModel):
+    seed: int = 42
     dataset_csv: Path
-    model_config: Path
+    model_config_path: Path = Field(alias="model_config")
     artifact_dir: Path
-    splits: SplitConfig
+    splits: SplitConfig = SplitConfig()
     training: TrainingConfig
-    loss: LossConfig
-    optuna: OptunaConfig
+    loss: LossConfig = LossConfig()
+    optuna: OptunaConfig = OptunaConfig()
+
+    @property
+    def artifacts_root(self) -> Path:
+        return self.artifact_dir.parent
 
 
 def load_yaml(path: str | Path) -> dict[str, Any]:
@@ -135,160 +184,8 @@ def load_yaml(path: str | Path) -> dict[str, Any]:
 
 
 def load_model_config(path: str | Path) -> ModelConfig:
-    raw = load_yaml(path)
-    backbone_raw = _required_mapping(raw, "backbone")
-    text_raw = raw.get("text", {})
-    classifier_raw = raw.get("classifier", {})
-
-    backbone = BackboneConfig(
-        name=_required_str(backbone_raw, "name"),
-        revision=str(backbone_raw.get("revision", "main")),
-        local_tokenizer_path=Path(_required_str(backbone_raw, "local_tokenizer_path")),
-    )
-    text = TextConfig(
-        max_length=int(text_raw.get("max_length", 128)),
-        truncation=bool(text_raw.get("truncation", True)),
-        padding=_validate_padding(str(text_raw.get("padding", "max_length"))),
-    )
-    if text.max_length <= 0:
-        raise ValueError("text.max_length must be positive")
-
-    classifier = ClassifierConfig(dropout=float(classifier_raw.get("dropout", 0.2)))
-    if not 0 <= classifier.dropout < 1:
-        raise ValueError("classifier.dropout must be in [0, 1)")
-
-    heads_raw = raw.get("heads")
-    if not isinstance(heads_raw, list) or not heads_raw:
-        raise ValueError("model_config.yaml must define at least one head")
-
-    heads = tuple(_parse_head(item) for item in heads_raw)
-    _validate_unique("head names", [head.name for head in heads])
-    return ModelConfig(backbone=backbone, text=text, classifier=classifier, heads=heads)
+    return ModelConfig.model_validate(load_yaml(path))
 
 
 def load_train_config(path: str | Path) -> TrainConfig:
-    raw = load_yaml(path)
-    training_raw = _required_mapping(raw, "training")
-    phase_1 = _parse_phase(_required_mapping(training_raw, "phase_1"))
-    phase_2 = _parse_phase(_required_mapping(training_raw, "phase_2"))
-    splits = _parse_splits(raw.get("splits", {}))
-    loss_raw = raw.get("loss", {})
-    optuna_raw = raw.get("optuna", {})
-
-    return TrainConfig(
-        seed=int(raw.get("seed", 42)),
-        dataset_csv=Path(_required_str(raw, "dataset_csv")),
-        model_config=Path(_required_str(raw, "model_config")),
-        artifact_dir=Path(_required_str(raw, "artifact_dir")),
-        splits=splits,
-        training=TrainingConfig(
-            phase_1=phase_1,
-            phase_2=phase_2,
-            weight_decay=float(training_raw.get("weight_decay", 0.01)),
-            gradient_clipping=float(training_raw.get("gradient_clipping", 1.0)),
-            early_stopping_patience=int(training_raw.get("early_stopping_patience", 3)),
-        ),
-        loss=LossConfig(
-            head_weights={
-                str(k): float(v) for k, v in (loss_raw.get("head_weights") or {}).items()
-            },
-            max_pos_weight=float(loss_raw.get("max_pos_weight", 10.0)),
-        ),
-        optuna=OptunaConfig(
-            enabled=bool(optuna_raw.get("enabled", False)),
-            n_trials=int(optuna_raw.get("n_trials", 30)),
-        ),
-    )
-
-
-def _parse_head(raw: Any) -> HeadConfig:
-    if not isinstance(raw, dict):
-        raise ValueError("Each head must be a mapping")
-    labels_raw = raw.get("labels")
-    if not isinstance(labels_raw, list) or not labels_raw:
-        raise ValueError(f"Head {raw.get('name', '<unknown>')} must define labels")
-    labels = tuple(str(label) for label in labels_raw)
-    _validate_unique(f"labels for head {raw.get('name')}", labels)
-    hidden_raw = _required_mapping(raw, "hidden_layer")
-    hidden = HiddenLayerConfig(
-        size=int(hidden_raw.get("size", 0)),
-        activation=_validate_activation(str(hidden_raw.get("activation", "gelu"))),
-    )
-    if hidden.size <= 0:
-        raise ValueError(f"Head {raw.get('name')} hidden_layer.size must be positive")
-    return HeadConfig(
-        name=_required_str(raw, "name"),
-        mode=_validate_head_mode(_required_str(raw, "mode")),
-        hidden_layer=hidden,
-        labels=labels,
-    )
-
-
-def _parse_phase(raw: dict[str, Any]) -> PhaseConfig:
-    learning_rate_backbone = raw.get("learning_rate_backbone")
-    return PhaseConfig(
-        freeze_backbone=bool(raw.get("freeze_backbone", False)),
-        epochs=int(raw.get("epochs", 1)),
-        learning_rate_classifier=float(raw.get("learning_rate_classifier", 5e-4)),
-        batch_size=int(raw.get("batch_size", 16)),
-        learning_rate_backbone=(
-            None if learning_rate_backbone is None else float(learning_rate_backbone)
-        ),
-    )
-
-
-def _parse_splits(raw: Any) -> SplitConfig:
-    if raw is None:
-        raw = {}
-    if not isinstance(raw, dict):
-        raise ValueError("splits must be a mapping")
-    split = SplitConfig(
-        train=float(raw.get("train", 0.7)),
-        validation=float(raw.get("validation", 0.1)),
-        calibration=float(raw.get("calibration", 0.1)),
-        test=float(raw.get("test", 0.1)),
-        group_column=raw.get("group_column"),
-    )
-    total = split.train + split.validation + split.calibration + split.test
-    if abs(total - 1.0) > 1e-6:
-        raise ValueError(f"Split fractions must sum to 1.0, got {total}")
-    return split
-
-
-def _required_mapping(raw: dict[str, Any], key: str) -> dict[str, Any]:
-    value = raw.get(key)
-    if not isinstance(value, dict):
-        raise ValueError(f"Missing or invalid mapping: {key}")
-    return value
-
-
-def _required_str(raw: dict[str, Any], key: str) -> str:
-    value = raw.get(key)
-    if value is None or str(value) == "":
-        raise ValueError(f"Missing required string: {key}")
-    return str(value)
-
-
-def _validate_unique(name: str, values: list[str] | tuple[str, ...]) -> None:
-    duplicates = sorted({value for value in values if values.count(value) > 1})
-    if duplicates:
-        raise ValueError(f"Duplicate {name}: {duplicates}")
-
-
-def _validate_head_mode(value: str) -> HeadMode:
-    if value not in {"multi_label", "single_label"}:
-        raise ValueError(f"Invalid head mode: {value}")
-    return value  # type: ignore[return-value]
-
-
-def _validate_activation(value: str) -> ActivationName:
-    if value not in {"gelu", "relu", "tanh"}:
-        raise ValueError(f"Invalid activation: {value}")
-    return value  # type: ignore[return-value]
-
-
-def _validate_padding(value: str) -> PaddingMode:
-    if value not in {"max_length", "longest", "do_not_pad"}:
-        raise ValueError(f"Invalid padding mode: {value}")
-    return value  # type: ignore[return-value]
-
+    return TrainConfig.model_validate(load_yaml(path))

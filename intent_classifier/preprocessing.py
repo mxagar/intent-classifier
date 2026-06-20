@@ -1,6 +1,5 @@
 """Text normalization and tokenizer artifact helpers."""
 
-from __future__ import annotations
 
 import logging
 import re

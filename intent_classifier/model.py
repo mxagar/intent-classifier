@@ -1,7 +1,5 @@
 """PyTorch model and ONNX helpers."""
 
-from __future__ import annotations
-
 import logging
 from pathlib import Path
 from typing import Any
@@ -74,7 +72,9 @@ class TextClassifier(nn.Module):
         outputs = self.encoder(input_ids=input_ids, attention_mask=attention_mask)
         pooled = outputs.last_hidden_state[:, 0, :]
         features = self.dropout(pooled)
-        return {name: head(features) for name, head in self.heads.items()}
+        logits = {name: head(features) for name, head in self.heads.items()}
+        logits["features"] = features
+        return logits
 
     def freeze_backbone(self) -> None:
         for parameter in self.encoder.parameters():
@@ -163,11 +163,10 @@ def postprocess_onnx_outputs(
 
 
 def _activation(name: ActivationName) -> nn.Module:
-    if name == "gelu":
+    if name == ActivationName.GELU:
         return nn.GELU()
-    if name == "relu":
+    if name == ActivationName.RELU:
         return nn.ReLU()
-    if name == "tanh":
+    if name == ActivationName.TANH:
         return nn.Tanh()
     raise ValueError(f"Unsupported activation: {name}")
-
