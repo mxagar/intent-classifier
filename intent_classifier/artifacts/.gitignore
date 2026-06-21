@@ -1,0 +1,7 @@
+*
+.*
+!.gitignore
+!CHANGELOG*
+!CHANGELOG.md
+!changelog*
+!changelog.md

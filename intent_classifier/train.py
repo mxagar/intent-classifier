@@ -2,6 +2,7 @@
 
 import argparse
 import logging
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -11,12 +12,14 @@ import optuna
 import torch
 import torch.nn.functional as F
 import yaml
-from onnxruntime.quantization import QuantType, quantize_dynamic
 from optuna.distributions import distribution_to_json, json_to_distribution
+from pydantic import BaseModel, ConfigDict
 from sklearn.metrics import f1_score, precision_recall_fscore_support
 from torch.optim import AdamW, Optimizer
 from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader
+from tqdm.auto import tqdm
+from transformers import PreTrainedTokenizerBase
 
 from intent_classifier.dataset import (
     RequestDataset,
@@ -31,13 +34,115 @@ from intent_classifier.settings import (
     LossConfig,
     ModelConfig,
     PhaseConfig,
+    SettingsConfig,
     TrainConfig,
     load_model_config,
+    load_settings_config,
     load_train_config,
 )
 from intent_classifier.utils import ensure_dir, load_json, save_json, set_seed, sha256_file
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class TrainingInputs:
+    train_config: TrainConfig
+    model_config: ModelConfig
+    model: TextClassifier
+    tokenizer: PreTrainedTokenizerBase
+    dataset: RequestDataset
+    loaders: dict[str, DataLoader[dict[str, Any]]]
+    device: torch.device
+
+    @classmethod
+    def from_settings(
+        cls,
+        settings: SettingsConfig | None = None,
+        device: torch.device | None = None,
+    ) -> "TrainingInputs":
+        resolved_settings = settings or load_settings_config()
+        train_config = load_train_config(resolved_settings.train_config_path)
+        model_config = load_model_config(resolved_settings.model_config_path)
+        return cls.from_configs(train_config, model_config, device=device)
+
+    @classmethod
+    def from_configs(
+        cls,
+        train_config: TrainConfig,
+        model_config: ModelConfig,
+        device: torch.device | None = None,
+    ) -> "TrainingInputs":
+        set_seed(train_config.seed)
+        artifact_dir = ensure_dir(train_config.current_artifact_dir)
+        tokenizer_dir = export_tokenizer(
+            model_config.backbone,
+            artifact_dir / model_config.backbone.local_tokenizer_path,
+        )
+        tokenizer = load_tokenizer(tokenizer_dir)
+        dataset = RequestDataset.from_csv(train_config.dataset_csv, model_config)
+        splits = split_ids(dataset.frame, train_config.splits, train_config.seed)
+        loaders = create_data_loaders(
+            dataset,
+            tokenizer,
+            model_config,
+            splits,
+            batch_size=train_config.training.phase_1.batch_size,
+        )
+        resolved_device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        model = create_model(model_config).to(resolved_device)
+        return cls(
+            train_config=train_config,
+            model_config=model_config,
+            model=model,
+            tokenizer=tokenizer,
+            dataset=dataset,
+            loaders=loaders,
+            device=resolved_device,
+        )
+
+    @classmethod
+    def from_objects(
+        cls,
+        train_config: TrainConfig,
+        model_config: ModelConfig,
+        model: TextClassifier,
+        tokenizer: PreTrainedTokenizerBase,
+        dataset: RequestDataset,
+        loaders: dict[str, DataLoader[dict[str, Any]]],
+        device: torch.device,
+    ) -> "TrainingInputs":
+        return cls(
+            train_config=train_config,
+            model_config=model_config,
+            model=model,
+            tokenizer=tokenizer,
+            dataset=dataset,
+            loaders=loaders,
+            device=device,
+        )
+
+
+class TrainingOutputs(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    model: TextClassifier
+    history: dict[str, Any]
+    calibration: dict[str, Any]
+    thresholds: dict[str, Any]
+    validation: dict[str, Any]
+    test: dict[str, Any]
+    artifact_dir: Path | None = None
+    checkpoint_path: Path | None = None
+    model_config_path: Path | None = None
+    train_config_path: Path | None = None
+    calibration_path: Path | None = None
+    thresholds_path: Path | None = None
+    evaluation_report_path: Path | None = None
+    training_history_path: Path | None = None
+    training_history_plot_path: Path | None = None
+    onnx_path: Path | None = None
+    quantized_onnx_path: Path | None = None
 
 
 def create_optimizer(
@@ -284,51 +389,68 @@ def evaluate(
     return metrics
 
 
-def fit(train_config: TrainConfig, model_config: ModelConfig) -> TextClassifier:
-    model, _ = _fit_with_reports(train_config, model_config, export_artifacts=True)
-    return model
-
-
-def _fit_with_reports(
-    train_config: TrainConfig,
-    model_config: ModelConfig,
-    export_artifacts: bool,
-) -> tuple[TextClassifier, dict[str, Any]]:
-    set_seed(train_config.seed)
-    artifact_dir = ensure_dir(train_config.artifact_dir)
-    tokenizer_dir = export_tokenizer(model_config.backbone, artifact_dir / "tokenizer")
-    tokenizer = load_tokenizer(tokenizer_dir)
-    dataset = RequestDataset.from_csv(train_config.dataset_csv, model_config)
-    splits = split_ids(dataset.frame, train_config.splits, train_config.seed)
-    loaders = create_data_loaders(
-        dataset,
-        tokenizer,
-        model_config,
-        splits,
-        batch_size=train_config.training.phase_1.batch_size,
+def fit(
+    model_config: ModelConfig | None = None,
+    train_config: TrainConfig | None = None,
+    training_inputs: TrainingInputs | None = None,
+) -> TrainingOutputs:
+    objects = _resolve_training_inputs(model_config, train_config, training_inputs)
+    return fit_with_history(
+        objects,
+        export_artifacts=True,
     )
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = create_model(model_config).to(device)
+
+
+def _resolve_training_inputs(
+    model_config: ModelConfig | None,
+    train_config: TrainConfig | None,
+    training_inputs: TrainingInputs | None,
+) -> TrainingInputs:
+    if training_inputs is not None:
+        return training_inputs
+    if model_config is None or train_config is None:
+        raise ValueError("Pass either training_inputs or both model_config and train_config")
+    return TrainingInputs.from_configs(train_config, model_config)
+
+
+def fit_with_history(
+    training_inputs: TrainingInputs,
+    export_artifacts: bool,
+) -> TrainingOutputs:
+    model = training_inputs.model
+    dataset = training_inputs.dataset
+    loaders = training_inputs.loaders
+    train_config = training_inputs.train_config
+    model_config = training_inputs.model_config
+    set_seed(train_config.seed)
+    artifact_dir = ensure_dir(train_config.current_artifact_dir)
+    resolved_device = training_inputs.device
+    model = model.to(resolved_device)
     pos_weights = (
         compute_pos_weights(dataset, model_config, train_config.loss.max_pos_weight)
         if train_config.loss.use_pos_weights
         else None
     )
 
+    epochs: list[dict[str, Any]] = []
     best_validation: dict[str, Any] | None = None
+    total_epochs = train_config.training.phase_1.epochs + train_config.training.phase_2.epochs
+    progress = tqdm(total=total_epochs, desc="Training", unit="epoch")
+    global_epoch = 0
     for phase in (train_config.training.phase_1, train_config.training.phase_2):
         model.freeze_backbone() if phase.freeze_backbone else model.unfreeze_backbone()
         optimizer = create_optimizer(model, phase, train_config.training.weight_decay)
         total_steps = len(loaders["train"]) * phase.epochs
         scheduler = create_scheduler(optimizer, total_steps)
         for epoch in range(phase.epochs):
+            global_epoch += 1
             loss = train_one_epoch(
                 model,
                 loaders["train"],
                 optimizer,
                 model_config,
                 train_config.loss,
-                device,
+                resolved_device,
                 pos_weights,
                 scheduler,
                 train_config.training.gradient_clipping,
@@ -338,9 +460,26 @@ def _fit_with_reports(
                 loaders["validation"],
                 model_config,
                 train_config.loss,
-                device,
+                resolved_device,
             )
             best_validation = validation_metrics
+            epochs.append(
+                {
+                    "freeze_backbone": phase.freeze_backbone,
+                    "epoch": epoch + 1,
+                    "global_epoch": global_epoch,
+                    "train_loss": loss,
+                    "validation": validation_metrics,
+                }
+            )
+            progress.set_postfix(
+                {
+                    "train_loss": f"{loss:.4f}",
+                    "val_loss": f"{validation_metrics['loss']:.4f}",
+                    "val_macro_f1": f"{validation_metrics['mean_macro_f1']:.4f}",
+                }
+            )
+            progress.update(1)
             logger.info(
                 "phase freeze=%s epoch=%s train_loss=%.4f validation_loss=%.4f",
                 phase.freeze_backbone,
@@ -348,20 +487,22 @@ def _fit_with_reports(
                 loss,
                 validation_metrics["loss"],
             )
+    progress.close()
 
     validation_logits, validation_labels = collect_logits_and_labels(
         model,
         loaders["validation"],
         model_config,
-        device,
+        resolved_device,
     )
     validation_probs = {
         head_name: sigmoid(values) for head_name, values in validation_logits.items()
     }
     calibration = calibrate_outputs(validation_logits, validation_labels, model_config)
     thresholds = tune_thresholds(validation_probs, validation_labels, model_config)
-    test_metrics = evaluate(model, loaders["test"], model_config, train_config.loss, device)
-    report = {
+    test_metrics = evaluate(model, loaders["test"], model_config, train_config.loss, resolved_device)
+    history = {
+        "epochs": epochs,
         "validation": best_validation or {},
         "test": test_metrics,
         "dataset": {
@@ -369,23 +510,50 @@ def _fit_with_reports(
             "csv_sha256": sha256_file(train_config.dataset_csv),
             **compute_label_distributions(dataset.frame, model_config),
             "split_rows": {
-                "train": len(splits.train),
-                "validation": len(splits.validation),
-                "test": len(splits.test),
+                "train": len(loaders["train"].dataset),
+                "validation": len(loaders["validation"].dataset),
+                "test": len(loaders["test"].dataset),
             },
         },
     }
 
+    outputs = TrainingOutputs(
+        model=model,
+        history=history,
+        calibration=calibration,
+        thresholds=thresholds,
+        validation=history["validation"],
+        test=history["test"],
+        artifact_dir=artifact_dir,
+    )
+
     if export_artifacts:
-        save_checkpoint(model, artifact_dir / "checkpoint.pt", model_config)
+        checkpoint_path = save_checkpoint(model, artifact_dir / "checkpoint.pt", model_config)
         save_runtime_configs(model_config, train_config, artifact_dir)
-        save_calibration(calibration, artifact_dir / "calibration.json")
-        save_thresholds(thresholds, artifact_dir / "thresholds.json")
-        save_json(report, artifact_dir / "evaluation_report.json")
-        onnx_path = export_onnx(model, model_config, artifact_dir / "model.onnx", device=device)
-        quantize_onnx(onnx_path, artifact_dir / "model.int8.onnx")
-        update_changelog(train_config.artifacts_root / "changelog.yaml", artifact_dir, report)
-    return model, report
+        calibration_path = artifact_dir / "calibration.json"
+        thresholds_path = artifact_dir / "thresholds.json"
+        evaluation_report_path = artifact_dir / "evaluation_report.json"
+        training_history_path = artifact_dir / "training_history.json"
+        training_history_plot_path = artifact_dir / "training_history.png"
+        save_calibration(calibration, calibration_path)
+        save_thresholds(thresholds, thresholds_path)
+        save_json(history, evaluation_report_path)
+        save_json(history, training_history_path)
+        plot_training_history(history, training_history_plot_path)
+        outputs = outputs.model_copy(
+            update={
+                "checkpoint_path": checkpoint_path,
+                "model_config_path": artifact_dir / "model_config.yaml",
+                "train_config_path": artifact_dir / "train_config.yaml",
+                "calibration_path": calibration_path,
+                "thresholds_path": thresholds_path,
+                "evaluation_report_path": evaluation_report_path,
+                "training_history_path": training_history_path,
+                "training_history_plot_path": training_history_plot_path,
+            }
+        )
+        update_changelog(train_config.artifacts_root / "changelog.yaml", artifact_dir, history)
+    return outputs
 
 
 def save_checkpoint(model: TextClassifier, path: str | Path, config: ModelConfig) -> Path:
@@ -413,9 +581,14 @@ def objective(
         model_config,
         hpo_dir,
     )
-    _, report = _fit_with_reports(trial_train_config, trial_model_config, export_artifacts=False)
+    training_inputs = TrainingInputs.from_configs(trial_train_config, trial_model_config)
+    outputs = fit_with_history(
+        training_inputs,
+        export_artifacts=False,
+    )
+    history = outputs.history
     metric_name = train_config.optuna.metric
-    value = float(report["validation"].get(metric_name, report["validation"].get("mean_macro_f1", 0.0)))
+    value = float(history["validation"].get(metric_name, history["validation"].get("mean_macro_f1", 0.0)))
     trial.set_user_attr("train_config", trial_train_config.model_dump(mode="json"))
     trial.set_user_attr("model_config", trial_model_config.model_dump(mode="json"))
     return value
@@ -470,7 +643,8 @@ def build_trial_configs(
     )
     trial_train_config = train_config.model_copy(
         update={
-            "artifact_dir": make_hpo_artifact_dir(hpo_dir or train_config.artifacts_root, trial_number),
+            "artifact_dir": Path(hpo_dir or train_config.artifacts_root) / "artifacts",
+            "version_dir": f"trial_{trial_number:04d}",
             "training": train_config.training.model_copy(
                 update={
                     "phase_1": phase_1,
@@ -520,18 +694,52 @@ def load_study(path: str | Path) -> optuna.Study:
     return study
 
 
-def train_study(study_json: str | Path, train_config: TrainConfig, model_config: ModelConfig) -> TextClassifier:
+def train_study(
+    study_json: str | Path,
+    train_config: TrainConfig,
+    model_config: ModelConfig,
+) -> TrainingOutputs:
     study_data = load_json(study_json)
     params = study_data.get("best_params")
     if not params:
         raise ValueError(f"No best_params found in study JSON: {study_json}")
     fixed_trial = optuna.trial.FixedTrial(params)
     final_train_config, final_model_config = build_trial_configs(fixed_trial, train_config, model_config)
-    final_train_config = final_train_config.model_copy(update={"artifact_dir": train_config.artifact_dir})
-    return fit(final_train_config, final_model_config)
+    final_train_config = final_train_config.model_copy(
+        update={
+            "artifact_dir": train_config.artifact_dir,
+            "version_dir": train_config.version_dir,
+        }
+    )
+    training_inputs = TrainingInputs.from_configs(final_train_config, final_model_config)
+    outputs = fit(training_inputs=training_inputs)
+    onnx_path, quantized_onnx_path = export_runtime_onnx(training_inputs, quantize=True)
+    return outputs.model_copy(
+        update={"onnx_path": onnx_path, "quantized_onnx_path": quantized_onnx_path}
+    )
+
+
+def export_runtime_onnx(
+    training_inputs: TrainingInputs,
+    quantize: bool = True,
+) -> tuple[Path, Path | None]:
+    artifact_dir = ensure_dir(training_inputs.train_config.current_artifact_dir)
+    onnx_path = artifact_dir / "model.onnx"
+    quantized_onnx_path = artifact_dir / "model.int8.onnx" if quantize else None
+    onnx_path = export_onnx(
+        training_inputs.model,
+        training_inputs.model_config,
+        onnx_path,
+        device=training_inputs.device,
+        quantize=quantize,
+        quantized_output_path=quantized_onnx_path,
+    )
+    return onnx_path, quantized_onnx_path
 
 
 def quantize_onnx(input_path: str | Path, output_path: str | Path) -> Path:
+    from onnxruntime.quantization import QuantType, quantize_dynamic
+
     output = Path(output_path)
     ensure_dir(output.parent)
     quantize_dynamic(str(input_path), str(output), weight_type=QuantType.QInt8)
@@ -606,10 +814,43 @@ def load_thresholds(path: str | Path) -> dict[str, Any]:
 
 
 def plot_training_history(history: dict[str, Any], output_path: str | Path) -> Path:
-    _ = history
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
     output = Path(output_path)
     ensure_dir(output.parent)
-    output.write_text("Plotting is not implemented yet.\n", encoding="utf-8")
+    epochs = history.get("epochs", [])
+    if not epochs:
+        output.write_text("No epoch history available.\n", encoding="utf-8")
+        return output
+
+    x_values = [entry.get("global_epoch", index + 1) for index, entry in enumerate(epochs)]
+    train_loss = [entry["train_loss"] for entry in epochs]
+    validation_loss = [entry["validation"]["loss"] for entry in epochs]
+    validation_macro_f1 = [entry["validation"]["mean_macro_f1"] for entry in epochs]
+    validation_weighted_f1 = [entry["validation"]["mean_weighted_f1"] for entry in epochs]
+
+    figure, (loss_axis, metric_axis) = plt.subplots(2, 1, figsize=(9, 7), sharex=True)
+    loss_axis.plot(x_values, train_loss, marker="o", label="train loss")
+    loss_axis.plot(x_values, validation_loss, marker="o", label="validation loss")
+    loss_axis.set_ylabel("Loss")
+    loss_axis.grid(True, alpha=0.3)
+    loss_axis.legend()
+
+    metric_axis.plot(x_values, validation_macro_f1, marker="o", label="validation macro F1")
+    metric_axis.plot(x_values, validation_weighted_f1, marker="o", label="validation weighted F1")
+    metric_axis.set_xlabel("Epoch")
+    metric_axis.set_ylabel("F1")
+    metric_axis.set_ylim(0.0, 1.0)
+    metric_axis.grid(True, alpha=0.3)
+    metric_axis.legend()
+
+    figure.suptitle("Training History")
+    figure.tight_layout()
+    figure.savefig(output, dpi=160)
+    plt.close(figure)
     return output
 
 
@@ -700,12 +941,12 @@ def main() -> None:
     """Run training or HPO from the command line.
 
     Examples:
-        uv run python -m intent_classifier.train --config intent_classifier/config/train_config.yaml
-        uv run python -m intent_classifier.train --config intent_classifier/config/train_config.yaml --hpo
-        uv run python -m intent_classifier.train --config intent_classifier/config/train_config.yaml --study-json intent_classifier/artifacts/hpo/20260101_120000/study.json
+        uv run python -m intent_classifier.train --settings intent_classifier/config/settings.yaml
+        uv run python -m intent_classifier.train --settings intent_classifier/config/settings.yaml --hpo
+        uv run python -m intent_classifier.train --settings intent_classifier/config/settings.yaml --study-json intent_classifier/artifacts/hpo/20260101_120000/study.json
     """
     parser = argparse.ArgumentParser(description="Train the intent classifier.")
-    parser.add_argument("--config", default="intent_classifier/config/train_config.yaml")
+    parser.add_argument("--settings", default="intent_classifier/config/settings.yaml")
     parser.add_argument("--hpo", action="store_true", help="Run Optuna HPO instead of normal training.")
     parser.add_argument(
         "--study-json",
@@ -718,8 +959,9 @@ def main() -> None:
         help="Override artifact directory. Use this for explicit vN output paths.",
     )
     args = parser.parse_args()
-    train_config = load_train_config(args.config)
-    model_config = load_model_config(train_config.model_config_path)
+    settings = load_settings_config(args.settings)
+    train_config = load_train_config(settings.train_config_path)
+    model_config = load_model_config(settings.model_config_path)
     if args.artifact_dir:
         train_config = train_config.model_copy(update={"artifact_dir": Path(args.artifact_dir)})
     if args.hpo:
@@ -727,7 +969,12 @@ def main() -> None:
     elif args.study_json:
         train_study(args.study_json, train_config, model_config)
     else:
-        fit(train_config, model_config)
+        training_inputs = TrainingInputs.from_configs(train_config, model_config)
+        outputs = fit(training_inputs=training_inputs)
+        onnx_path, quantized_onnx_path = export_runtime_onnx(training_inputs, quantize=True)
+        _ = outputs.model_copy(
+            update={"onnx_path": onnx_path, "quantized_onnx_path": quantized_onnx_path}
+        )
 
 
 if __name__ == "__main__":

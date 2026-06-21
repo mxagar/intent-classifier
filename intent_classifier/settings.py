@@ -33,10 +33,27 @@ class FrozenConfigModel(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid", populate_by_name=True)
 
 
+class LoggingConfig(FrozenConfigModel):
+    level: str = "INFO"
+
+
+class SettingsConfig(FrozenConfigModel):
+    model_config_path: Path = Field(alias="model_config")
+    train_config_path: Path = Field(alias="train_config")
+    logging: LoggingConfig = LoggingConfig()
+
+
 class BackboneConfig(FrozenConfigModel):
     name: str
     revision: str = "main"
     local_tokenizer_path: Path
+
+    @field_validator("local_tokenizer_path")
+    @classmethod
+    def local_tokenizer_path_must_be_relative(cls, path: Path) -> Path:
+        if path.is_absolute():
+            raise ValueError("local_tokenizer_path must be relative to the artifact version directory")
+        return path
 
 
 class TextConfig(FrozenConfigModel):
@@ -163,16 +180,27 @@ class OptunaConfig(FrozenConfigModel):
 class TrainConfig(FrozenConfigModel):
     seed: int = 42
     dataset_csv: Path
-    model_config_path: Path = Field(alias="model_config")
     artifact_dir: Path
+    version_dir: Path
     splits: SplitConfig = SplitConfig()
     training: TrainingConfig
     loss: LossConfig = LossConfig()
     optuna: OptunaConfig = OptunaConfig()
 
+    @field_validator("version_dir")
+    @classmethod
+    def version_dir_must_be_relative(cls, path: Path) -> Path:
+        if path.is_absolute():
+            raise ValueError("version_dir must be relative to artifact_dir")
+        return path
+
     @property
     def artifacts_root(self) -> Path:
-        return self.artifact_dir.parent
+        return self.artifact_dir
+
+    @property
+    def current_artifact_dir(self) -> Path:
+        return self.artifact_dir / self.version_dir
 
 
 def load_yaml(path: str | Path) -> dict[str, Any]:
@@ -189,3 +217,7 @@ def load_model_config(path: str | Path) -> ModelConfig:
 
 def load_train_config(path: str | Path) -> TrainConfig:
     return TrainConfig.model_validate(load_yaml(path))
+
+
+def load_settings_config(path: str | Path = "intent_classifier/config/settings.yaml") -> SettingsConfig:
+    return SettingsConfig.model_validate(load_yaml(path))

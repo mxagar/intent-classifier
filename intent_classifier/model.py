@@ -7,6 +7,7 @@ from typing import Any
 import numpy as np
 import onnxruntime as ort
 import torch
+from onnxruntime.quantization import QuantType, quantize_dynamic
 from torch import nn
 from transformers import AutoModel
 
@@ -115,6 +116,8 @@ def export_onnx(
     output_path: str | Path,
     opset_version: int = 17,
     device: torch.device | None = None,
+    quantize: bool = False,
+    quantized_output_path: str | Path | None = None,
 ) -> Path:
     """Export raw logits for each configured head."""
     output = Path(output_path)
@@ -142,7 +145,14 @@ def export_onnx(
         output_names=output_names,
         dynamic_axes=dynamic_axes,
         opset_version=opset_version,
+        dynamo=False,
     )
+    if quantize:
+        quantized_output = Path(quantized_output_path) if quantized_output_path else output.with_suffix(
+            ".int8.onnx"
+        )
+        ensure_dir(quantized_output.parent)
+        quantize_dynamic(str(output), str(quantized_output), weight_type=QuantType.QInt8)
     return output
 
 

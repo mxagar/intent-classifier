@@ -1,7 +1,7 @@
 seed: 42
 dataset_csv: dataset/example_dataset.csv
-model_config: intent_classifier/config/model_config.yaml
-artifact_dir: intent_classifier/artifacts/v1
+artifact_dir: intent_classifier/artifacts
+version_dir: v1
 
 splits:
   train: 0.8

@@ -1,3 +1,5 @@
+model_config: intent_classifier/config/model_config.yaml
+train_config: intent_classifier/config/train_config.yaml
+
 logging:
   level: INFO
-

@@ -1,7 +1,7 @@
 backbone:
   name: microsoft/Multilingual-MiniLM-L12-H384
   revision: main
-  local_tokenizer_path: intent_classifier/artifacts/tokenizer
+  local_tokenizer_path: tokenizer
 
 text:
   max_length: 128

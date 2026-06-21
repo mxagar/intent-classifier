@@ -18,10 +18,26 @@ This project uses `uv`.
 uv sync --extra dev
 ```
 
-Run tests:
+Activate the virtual environment:
 
 ```bash
-uv run pytest -q
+source .venv/bin/activate
+```
+
+You can also skip manual activation and prefix commands with `uv run`.
+
+Run the full local verification suite:
+
+```bash
+uv run nox
+```
+
+Run individual sessions:
+
+```bash
+uv run nox -s lint
+uv run nox -s typecheck
+uv run nox -s tests
 ```
 
 The example dataset is:
@@ -79,14 +95,14 @@ Run the default training command:
 
 ```bash
 uv run python -m intent_classifier.train \
-  --config intent_classifier/config/train_config.yaml
+  --settings intent_classifier/config/settings.yaml
 ```
 
 Run hyperparameter optimization:
 
 ```bash
 uv run python -m intent_classifier.train \
-  --config intent_classifier/config/train_config.yaml \
+  --settings intent_classifier/config/settings.yaml \
   --hpo
 ```
 
@@ -94,7 +110,7 @@ Train a final model from a saved HPO study:
 
 ```bash
 uv run python -m intent_classifier.train \
-  --config intent_classifier/config/train_config.yaml \
+  --settings intent_classifier/config/settings.yaml \
   --study-json intent_classifier/artifacts/hpo/<run_timestamp>/study.json
 ```
 
@@ -117,6 +133,8 @@ train_config.yaml
 calibration.json
 thresholds.json
 evaluation_report.json
+training_history.json
+training_history.png
 tokenizer/
 ```
 

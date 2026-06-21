@@ -141,7 +141,7 @@ Example:
 backbone:
   name: microsoft/Multilingual-MiniLM-L12-H384
   revision: <pinned_revision>
-  local_tokenizer_path: artifacts/tokenizer
+  local_tokenizer_path: tokenizer
 
 text:
   max_length: 128
@@ -1247,7 +1247,7 @@ Expected commands:
 ```bash
 uv sync
 uv run pytest
-uv run python -m intent_classifier.train --config intent_classifier/config/train_config.yaml
+uv run python -m intent_classifier.train --settings intent_classifier/config/settings.yaml
 uv run python -m intent_classifier.evaluate --artifact-dir intent_classifier/artifacts/v1
 ```
 
