@@ -27,7 +27,7 @@ from intent_classifier.dataset import (
     create_data_loaders,
     split_ids,
 )
-from intent_classifier.model import TextClassifier, create_model, export_onnx
+from intent_classifier.model import TextClassifier, create_model, export_onnx as export_model_onnx
 from intent_classifier.preprocessing import export_tokenizer, load_tokenizer
 from intent_classifier.settings import (
     HeadMode,
@@ -134,6 +134,8 @@ class TrainingOutputs(BaseModel):
     test: dict[str, Any]
     artifact_dir: Path | None = None
     checkpoint_path: Path | None = None
+    checkpoint_best_path: Path | None = None
+    checkpoint_last_path: Path | None = None
     model_config_path: Path | None = None
     train_config_path: Path | None = None
     calibration_path: Path | None = None
@@ -434,6 +436,10 @@ def fit_with_history(
 
     epochs: list[dict[str, Any]] = []
     best_validation: dict[str, Any] | None = None
+    best_epoch: int | None = None
+    best_metric_name = train_config.optuna.metric
+    best_metric_value: float | None = None
+    best_state_dict: dict[str, torch.Tensor] | None = None
     total_epochs = train_config.training.phase_1.epochs + train_config.training.phase_2.epochs
     progress = tqdm(total=total_epochs, desc="Training", unit="epoch")
     global_epoch = 0
@@ -462,7 +468,15 @@ def fit_with_history(
                 train_config.loss,
                 resolved_device,
             )
-            best_validation = validation_metrics
+            metric_value = _checkpoint_metric_value(validation_metrics, best_metric_name)
+            if _is_better_checkpoint_metric(metric_value, best_metric_value, best_metric_name):
+                best_metric_value = metric_value
+                best_validation = validation_metrics
+                best_epoch = global_epoch
+                best_state_dict = {
+                    name: tensor.detach().cpu().clone()
+                    for name, tensor in model.state_dict().items()
+                }
             epochs.append(
                 {
                     "freeze_backbone": phase.freeze_backbone,
@@ -470,6 +484,10 @@ def fit_with_history(
                     "global_epoch": global_epoch,
                     "train_loss": loss,
                     "validation": validation_metrics,
+                    "checkpoint_metric": {
+                        "name": best_metric_name,
+                        "value": metric_value,
+                    },
                 }
             )
             progress.set_postfix(
@@ -489,6 +507,10 @@ def fit_with_history(
             )
     progress.close()
 
+    last_state_dict = {name: tensor.detach().cpu().clone() for name, tensor in model.state_dict().items()}
+    if best_state_dict is not None:
+        model.load_state_dict(best_state_dict)
+
     validation_logits, validation_labels = collect_logits_and_labels(
         model,
         loaders["validation"],
@@ -505,6 +527,12 @@ def fit_with_history(
         "epochs": epochs,
         "validation": best_validation or {},
         "test": test_metrics,
+        "best_checkpoint": {
+            "metric": best_metric_name,
+            "value": best_metric_value,
+            "epoch": best_epoch,
+            "higher_is_better": not _metric_is_loss(best_metric_name),
+        },
         "dataset": {
             "csv_path": str(train_config.dataset_csv),
             "csv_sha256": sha256_file(train_config.dataset_csv),
@@ -528,6 +556,16 @@ def fit_with_history(
     )
 
     if export_artifacts:
+        checkpoint_last_path = save_checkpoint_state(
+            last_state_dict,
+            artifact_dir / "checkpoint_last.pt",
+            model_config,
+        )
+        checkpoint_best_path = save_checkpoint_state(
+            best_state_dict or last_state_dict,
+            artifact_dir / "checkpoint_best.pt",
+            model_config,
+        )
         checkpoint_path = save_checkpoint(model, artifact_dir / "checkpoint.pt", model_config)
         save_runtime_configs(model_config, train_config, artifact_dir)
         calibration_path = artifact_dir / "calibration.json"
@@ -543,6 +581,8 @@ def fit_with_history(
         outputs = outputs.model_copy(
             update={
                 "checkpoint_path": checkpoint_path,
+                "checkpoint_best_path": checkpoint_best_path,
+                "checkpoint_last_path": checkpoint_last_path,
                 "model_config_path": artifact_dir / "model_config.yaml",
                 "train_config_path": artifact_dir / "train_config.yaml",
                 "calibration_path": calibration_path,
@@ -563,10 +603,44 @@ def save_checkpoint(model: TextClassifier, path: str | Path, config: ModelConfig
     return output
 
 
+def save_checkpoint_state(
+    state_dict: dict[str, torch.Tensor],
+    path: str | Path,
+    config: ModelConfig,
+) -> Path:
+    output = Path(path)
+    ensure_dir(output.parent)
+    torch.save({"state_dict": state_dict, "head_names": config.head_names}, output)
+    return output
+
+
 def load_checkpoint(model: TextClassifier, path: str | Path, map_location: str = "cpu") -> TextClassifier:
     checkpoint = torch.load(path, map_location=map_location)
     model.load_state_dict(checkpoint["state_dict"])
     return model
+
+
+def _checkpoint_metric_value(metrics: dict[str, Any], metric_name: str) -> float:
+    value = metrics.get(metric_name)
+    if value is None:
+        value = metrics.get("mean_macro_f1", metrics.get("loss", 0.0))
+    return float(value)
+
+
+def _metric_is_loss(metric_name: str) -> bool:
+    return "loss" in metric_name.lower()
+
+
+def _is_better_checkpoint_metric(
+    current: float,
+    best: float | None,
+    metric_name: str,
+) -> bool:
+    if best is None:
+        return True
+    if _metric_is_loss(metric_name):
+        return current < best
+    return current > best
 
 
 def objective(
@@ -726,7 +800,7 @@ def export_runtime_onnx(
     artifact_dir = ensure_dir(training_inputs.train_config.current_artifact_dir)
     onnx_path = artifact_dir / "model.onnx"
     quantized_onnx_path = artifact_dir / "model.int8.onnx" if quantize else None
-    onnx_path = export_onnx(
+    onnx_path = export_model_onnx(
         training_inputs.model,
         training_inputs.model_config,
         onnx_path,

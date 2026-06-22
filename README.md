@@ -126,6 +126,8 @@ Expected files include:
 
 ```text
 checkpoint.pt
+checkpoint_best.pt
+checkpoint_last.pt
 model.onnx
 model.int8.onnx
 model_config.yaml

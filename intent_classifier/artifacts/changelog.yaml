@@ -1,6 +1,6 @@
 v1:
   artifact_dir: intent_classifier/artifacts/v1
-  created_at: '2026-06-21T18:04:16'
+  created_at: '2026-06-21T19:08:57'
   dataset:
     csv_path: dataset/example_dataset.csv
     csv_sha256: e24da3b97b71e0639cd9b545f02f2fc62f8be82df2d9c7e15d690d0ae0f41764
